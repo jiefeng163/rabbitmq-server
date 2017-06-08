@@ -101,12 +101,13 @@ init() ->
             rabbit_log:info("Node database directory at ~s is empty. "
                             "Assuming we need to join an existing cluster or initialise from scratch...~n",
                             [dir()]),
-             rabbit_peer_discovery:log_configured_backend(),
-            init_from_config();
+            rabbit_peer_discovery:log_configured_backend(),
+            init_with_lock();
         false ->
             NodeType = node_type(),
             init_db_and_upgrade(cluster_nodes(all), NodeType,
-                                NodeType =:= ram, _Retry = true)
+                                NodeType =:= ram, _Retry = true),
+            rabbit_peer_discovery:maybe_register()
     end,
     %% We intuitively expect the global name server to be synced when
     %% Mnesia is up. In fact that's not guaranteed to be the case -
@@ -114,13 +115,43 @@ init() ->
     ok = rabbit_node_monitor:global_sync(),
     ok.
 
+init_with_lock() ->
+    {Retries, Timeout} = rabbit_peer_discovery:retry_timeout(),
+    init_with_lock(Retries, Timeout).
+
+init_with_lock(0, _) ->
+    case rabbit_peer_discovery:lock_acquisition_failure_mode() of
+        ignore ->
+            rabbit_log:warning("Cannot acquire a lock during clustering", []),
+            init_from_config(),
+            rabbit_peer_discovery:maybe_register();
+        fail ->
+            exit(cannot_acquire_startup_lock)
+    end;
+init_with_lock(Retries, Timeout) ->
+    case rabbit_peer_discovery:lock() of
+        not_supported ->
+            %% See rabbitmq/rabbitmq-server#1202 for details.
+            rabbit_peer_discovery:maybe_inject_randomized_delay(),
+            init_from_config(),
+            rabbit_peer_discovery:maybe_register();
+        {error, _Reason} ->
+            timer:sleep(Timeout),
+            init_with_lock(Retries - 1, Timeout);
+        {ok, Data} ->
+            try
+                init_from_config(),
+                rabbit_peer_discovery:maybe_register()
+            after
+                rabbit_peer_discovery:unlock(Data)
+            end
+    end.
+
 init_from_config() ->
     FindBadNodeNames = fun
         (Name, BadNames) when is_atom(Name) -> BadNames;
         (Name, BadNames)                    -> [Name | BadNames]
     end,
-    %% See rabbitmq/rabbitmq-server#1202 for details.
-    rabbit_peer_discovery:maybe_inject_randomized_delay(),
     {DiscoveredNodes, NodeType} =
         case rabbit_peer_discovery:discover_cluster_nodes() of
             {ok, {Nodes, Type} = Config}
